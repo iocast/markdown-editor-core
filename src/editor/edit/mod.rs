@@ -101,6 +101,16 @@ impl EditorCore {
                 let pos = self.layout.borrow().hit(x, y);
                 self.drag_to(pos);
                 self.touch();
+                // Follows the pointer rather than the head, which can be at
+                // the far end of a long block. Staying on the pressed line
+                // never scrolls, so a shaky click near the edge stays put.
+                let left_line = {
+                    let layout = self.layout.borrow();
+                    layout.line_for(pos) != layout.line_for(self.sel.anchor)
+                };
+                if left_line {
+                    return self.scroll_to(pos);
+                }
             }
             Input::OpenLink { x, y } => {
                 let pos = self.layout.borrow().hit(x, y);

@@ -1261,7 +1261,12 @@ impl EditorCore {
 
     /// Scrolls so that the caret is visible.
     pub(crate) fn scroll_to_caret(&mut self) -> Task {
-        let caret = self.layout.borrow().caret(self.sel.head);
+        self.scroll_to(self.sel.head)
+    }
+
+    /// Scrolls so that `pos` is visible.
+    pub(crate) fn scroll_to(&mut self, pos: Pos) -> Task {
+        let caret = self.layout.borrow().caret(pos);
         let Some((x, y, height)) = caret else {
             return Task::none();
         };

@@ -753,3 +753,83 @@ fn drag_after_double_click_keeps_the_whole_word() {
     editor.update(Input::Drag { x, y });
     assert_eq!(editor.sel.range(), (Pos::new(0, 0), Pos::new(0, 12)));
 }
+
+#[test]
+fn dragging_a_selection_to_the_edges_scrolls_along() {
+    let text = "line\n\n".repeat(400);
+    let mut editor = EditorCore::with_markdown(&text);
+    let height = editor.viewport.get().height;
+    editor.update(Input::Press {
+        x: 100.0,
+        y: 100.0,
+        clicks: 1,
+    });
+
+    // The pointer stays at the bottom edge while the page moves below it.
+    for _ in 0..20 {
+        let y = editor.scroll_y + height - 5.0;
+        editor.update(Input::Drag { x: 100.0, y });
+    }
+    let bottom = editor.scroll_y;
+    assert!(bottom > 100.0, "scrolled down to {bottom}");
+    let (_, caret, line) = editor.layout.borrow().caret(editor.sel.head).unwrap();
+    assert!(caret >= bottom && caret + line <= bottom + height);
+
+    // And back up at the top edge, with the selection still growing.
+    for _ in 0..5 {
+        let y = editor.scroll_y + 5.0;
+        editor.update(Input::Drag { x: 100.0, y });
+    }
+    assert!(
+        editor.scroll_y < bottom,
+        "scrolled up to {}",
+        editor.scroll_y
+    );
+    assert_ne!(editor.sel.anchor, editor.sel.head);
+}
+
+#[test]
+fn a_shaky_click_near_the_edge_does_not_scroll() {
+    let text = "line\n\n".repeat(400);
+    let mut editor = EditorCore::with_markdown(&text);
+    let height = editor.viewport.get().height;
+    let y = {
+        let layout = editor.layout.borrow();
+        let line = layout
+            .lines
+            .iter()
+            .rfind(|line| line.y + line.height / 2.0 < height - 1.0)
+            .unwrap();
+        line.y + line.height / 2.0
+    };
+    assert!(y > height - 24.0 - 40.0, "a line close to the edge: {y}");
+    editor.update(Input::Press {
+        x: 100.0,
+        y,
+        clicks: 1,
+    });
+    editor.update(Input::Drag { x: 101.0, y });
+    assert_eq!(editor.scroll_y, 0.0);
+}
+
+#[test]
+fn extending_by_a_long_block_does_not_jump_to_its_end() {
+    let text = format!("{}\n", "word ".repeat(6000));
+    let mut editor = EditorCore::with_markdown(&text);
+    assert!(editor.max_scroll().1 > 0.0, "the block overflows");
+    editor.update(Input::Press {
+        x: 100.0,
+        y: 60.0,
+        clicks: 3,
+    });
+    editor.update(Input::Drag { x: 104.0, y: 60.0 });
+    assert_eq!(editor.scroll_y, 0.0);
+
+    // Dragging on through the block still follows the pointer.
+    let height = editor.viewport.get().height;
+    for _ in 0..10 {
+        let y = editor.scroll_y + height - 5.0;
+        editor.update(Input::Drag { x: 100.0, y });
+    }
+    assert!(editor.scroll_y > 0.0);
+}
