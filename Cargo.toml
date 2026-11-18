@@ -12,7 +12,7 @@ readme = "README.md"
 keywords = ["markdown", "editor", "wysiwyg", "commonmark"]
 categories = ["text-editors"]
 # The fonts and the CommonMark suite are only used by the tests.
-exclude = [".github/", ".claude/", "tests/"]
+exclude = [".github/", ".claude/", "scripts/", "tests/"]
 
 [features]
 default = []
