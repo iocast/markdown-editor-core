@@ -5,6 +5,8 @@ Format: Keep a Changelog (https://keepachangelog.com), versioning: Semantic Vers
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-18
+
 ### Fixed
 - Dragging a selection to the edge of the view now scrolls along
 
@@ -13,5 +15,6 @@ Format: Keep a Changelog (https://keepachangelog.com), versioning: Semantic Vers
 ### Added
 - The UI-independent core of `iced-markdown-editor` and `frust-markdown-editor`: document model, Markdown import and export, layout and pagination, editing, selection, undo, source mode, tables and a display list
 
-[unreleased]: https://github.com/iocast/markdown-editor-core/compare/v0.1.0...HEAD
+[unreleased]: https://github.com/iocast/markdown-editor-core/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/iocast/markdown-editor-core/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/iocast/markdown-editor-core/releases/tag/v0.1.0
