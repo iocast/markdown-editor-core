@@ -1,0 +1,1311 @@
+//! The editor without a user interface.
+//!
+//! * [`EditorCore`] owns the document, selection, history, paper, zoom,
+//!   tab width, highlighter, image settings and style.
+//! * A UI turns its events into [`Input`]s and passes them to
+//!   [`EditorCore::update`], which returns an [`Update`]: the [`Event`]s that
+//!   happened and the [`Effect`]s the UI must carry out.
+//! * [`EditorCore::content_scene`] gives the document as a display list, which
+//!   the UI replays with its framework.
+//!
+//! * `edit`: keyboard, mouse and commands.
+//! * `source`: Markdown source mode.
+
+mod edit;
+pub mod source;
+
+pub use edit::builtin_command;
+
+use crate::doc::{Block, BlockKind, ColumnAlign, Container, Document, Leaf, Pos, Selection, Style};
+use crate::draw::{Frame, Op};
+use crate::extension::{BlockRenderer, Rectangle, RenderRequest};
+use crate::features::Features;
+use crate::fonts::Fonts;
+use crate::geometry::{Color, Point, Size};
+use crate::highlight::{self, COMMON_LANGUAGES, CodeHighlighter, HighlightRequest};
+use crate::images::{
+    self, ImageCache, ImageId, ImageLoader, ImageRejection, ImageSettings, ImageSource, PastedImage,
+};
+use crate::keyboard::{Key, Modifiers, ScrollDelta};
+use crate::layout::{Layout, Lookups, compute as compute_layout};
+use crate::markdown;
+use crate::page::Paper;
+use crate::render;
+use crate::style::EditorStyle;
+use crate::zoom::ZoomSettings;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+// `std::time::Instant` panics in the browser; `web_time` is std on desktop.
+use web_time::Instant;
+
+pub const BLINK: Duration = Duration::from_millis(530);
+
+/// Default number of spaces inserted by the Tab key.
+pub const DEFAULT_TAB_WIDTH: usize = 4;
+
+/// Editing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Formatted, Word-like editing.
+    Wysiwyg,
+    /// Raw Markdown text.
+    Source,
+}
+
+/// What happened in the UI, in terms of the editor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Input {
+    Key(Key, Modifiers, Option<String>),
+    Modifiers(Modifiers),
+    /// Press in document coordinates.
+    Press {
+        x: f32,
+        y: f32,
+        clicks: u8,
+    },
+    /// Drag in document coordinates.
+    Drag {
+        x: f32,
+        y: f32,
+    },
+    /// Middle click in document coordinates: follow the link there.
+    OpenLink {
+        x: f32,
+        y: f32,
+    },
+    PressOutside,
+    /// Right press: `at` in widget coordinates, `x` / `y` in document
+    /// coordinates.
+    ContextMenu {
+        at: Point,
+        x: f32,
+        y: f32,
+    },
+    /// Closes the context menu.
+    CloseMenu,
+    /// Timer tick of a UI that blinks the caret with [`EditorCore::caret_on`].
+    Blink,
+    /// Scroll by a distance in pixels.
+    ScrollBy {
+        dx: f32,
+        dy: f32,
+    },
+    /// Scroll to an absolute offset (scrollbar drag).
+    ScrollTo {
+        x: Option<f32>,
+        y: Option<f32>,
+    },
+    /// Ctrl/Cmd + wheel or pinch: zoom.
+    Wheel(ScrollDelta),
+    Command(Command),
+    LinkUrl(String),
+    /// Opens the link dialog for the selection (context menu).
+    LinkDialog,
+    /// Text to display, typed in the link dialog.
+    LinkText(String),
+    /// Tab in the link dialog: the other field.
+    LinkTab,
+    LinkApply,
+    LinkRemove,
+    LinkCancel,
+    Paste(Option<String>),
+    /// A file dropped onto the window.
+    FileDropped(PathBuf),
+    /// The input method's text being composed (preedit), shown inline
+    /// at the caret; empty removes it.
+    Compose(String),
+    /// The input method's finished text: replaces the preedit.
+    Commit(String),
+    /// The input method session ended: the preedit stays as typed text.
+    EndCompose,
+    /// The last pointer input came from a touch screen (`true`) or a mouse:
+    /// bars and menus get larger targets for fingers.
+    Touch(bool),
+}
+
+/// Operations that can be triggered programmatically.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Command {
+    Undo,
+    Redo,
+    ToggleBold,
+    ToggleItalic,
+    ToggleStrike,
+    ToggleCode,
+    /// Changes the paragraph(s) under the selection: block type, list,
+    /// task list or block quote. Applying the current kind again reverts.
+    SetBlock(BlockKind),
+    /// Checks or unchecks the task list item(s) under the selection.
+    ToggleChecked,
+    /// Sets the language of the code block(s) under the selection.
+    SetCodeLanguage(Option<String>),
+    InsertRule,
+    /// Inserts an empty table; `rows` includes the header row.
+    InsertTable {
+        rows: usize,
+        columns: usize,
+    },
+    /// Inserts a row above or below the row at the caret.
+    InsertRow {
+        below: bool,
+    },
+    /// Inserts a column left or right of the column at the caret.
+    InsertColumn {
+        right: bool,
+    },
+    /// Deletes the table row at the caret.
+    DeleteRow,
+    /// Deletes the table column at the caret.
+    DeleteColumn,
+    /// Deletes the table at the caret.
+    DeleteTable,
+    /// Aligns the table column at the caret.
+    SetColumnAlign(ColumnAlign),
+    /// Opens the link bar for the selection (or word under the caret).
+    EditLink,
+    /// Inserts text at the caret, replacing the selection.
+    InsertText(String),
+    /// Same as the Tab key.
+    Indent,
+    /// Same as Shift+Tab.
+    Outdent,
+    SelectAll,
+    Copy,
+    Cut,
+    /// Pastes an image (with the `images` feature, desktop) or text.
+    Paste,
+    /// Inserts an image from its encoded bytes, following the [`ImageSettings`].
+    InsertImage {
+        bytes: Vec<u8>,
+        /// File name, used as description and in [`PastedImage::name`].
+        name: Option<String>,
+    },
+    /// Like [`Command::InsertImage`] with the content of a file (desktop).
+    InsertImageFile(PathBuf),
+    /// Inserts `![alt](url)` for an image that already has a URL.
+    InsertImageLink {
+        url: String,
+        alt: String,
+    },
+    /// Answer to [`Event::ImagePasted`]: the placeholder becomes `![alt](url)`.
+    ResolveImage {
+        id: ImageId,
+        url: String,
+        alt: String,
+    },
+    /// Answer to [`Event::ImagePasted`]: the placeholder is removed.
+    CancelImage {
+        id: ImageId,
+    },
+    /// Emits [`Event::ImageRequested`] (the toolbar's image button).
+    RequestImage,
+    SetMode(Mode),
+    Focus,
+    Blur,
+    ZoomIn,
+    ZoomOut,
+    ResetZoom,
+    /// Sets a zoom factor (1.0 = 100 %).
+    SetZoom(f32),
+    /// Zooms so the page width fits the widget.
+    FitWidth,
+    /// Zooms so a whole page fits the widget.
+    FitPage,
+}
+
+/// Something that happened inside the editor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// The document content changed. Call [`EditorCore::markdown`] here,
+    /// not in `view`.
+    Changed,
+    /// The caret or selection moved.
+    SelectionChanged,
+    ModeChanged(Mode),
+    /// The zoom factor changed (1.0 = 100 %).
+    ZoomChanged(f32),
+    Focused,
+    Blurred,
+    /// A link was Ctrl/Cmd-clicked.
+    LinkClicked(String),
+    /// An image to store ([`ImageMode::Delegate`](crate::ImageMode::Delegate)).
+    /// Answer with [`Command::ResolveImage`] or [`Command::CancelImage`].
+    ImagePasted(PastedImage),
+    /// An image was not accepted.
+    ImageRejected {
+        source: ImageSource,
+        reason: ImageRejection,
+    },
+    /// The toolbar's image button was pressed. Show a file dialog.
+    ImageRequested,
+}
+
+/// Result of [`EditorCore::update`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Update {
+    /// Events produced by this update, in order.
+    pub events: Vec<Event>,
+    /// Work for the UI, in order.
+    pub effects: Vec<Effect>,
+}
+
+/// Work the core cannot do itself: the UI performs it with its framework.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// Put this text on the clipboard.
+    WriteClipboard(String),
+    /// Read the clipboard and answer with [`Input::Paste`].
+    ReadClipboard,
+    /// The link dialog opened: focus its address field and select its text.
+    FocusLinkDialog,
+    /// Move the focus to the other field of the link dialog.
+    CycleLinkFocus,
+}
+
+/// The effects of handling one input.
+#[must_use]
+#[derive(Debug, Default)]
+pub(crate) struct Task(pub(crate) Vec<Effect>);
+
+impl Task {
+    pub(crate) fn none() -> Task {
+        Task(Vec::new())
+    }
+
+    pub(crate) fn write_clipboard(text: String) -> Task {
+        Task(vec![Effect::WriteClipboard(text)])
+    }
+
+    pub(crate) fn read_clipboard() -> Task {
+        Task(vec![Effect::ReadClipboard])
+    }
+
+    pub(crate) fn focus_link_dialog() -> Task {
+        Task(vec![Effect::FocusLinkDialog])
+    }
+
+    pub(crate) fn cycle_link_focus() -> Task {
+        Task(vec![Effect::CycleLinkFocus])
+    }
+
+    pub(crate) fn batch(tasks: impl IntoIterator<Item = Task>) -> Task {
+        Task(tasks.into_iter().flat_map(|task| task.0).collect())
+    }
+}
+
+/// State of the open link dialog. The address lives in
+/// [`EditorCore::link_url`], like for the link bar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkDialog {
+    /// Text to display; `None` when the selection cannot be retyped
+    /// (several paragraphs, images, raw HTML).
+    pub text: Option<String>,
+    /// The selected text when the dialog opened.
+    pub original: String,
+    /// The selection already is a link.
+    pub editing: bool,
+}
+
+/// Formatting at the caret, for building custom toolbars.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Formatting {
+    pub bold: bool,
+    pub italic: bool,
+    pub strike: bool,
+    pub code: bool,
+    pub link: Option<String>,
+    /// Block type: `Paragraph`, `Heading`, `Code`, `Rule` or `Html`.
+    pub block: BlockKind,
+    /// Innermost list: `Some(true)` numbered, `Some(false)` bullets.
+    pub list: Option<bool>,
+    /// Task state of the innermost list item.
+    pub task: Option<bool>,
+    /// Number of nested lists at the caret.
+    pub list_depth: usize,
+    /// The caret is inside a block quote.
+    pub quote: bool,
+    /// Language of the code block at the caret, if any.
+    pub code_language: Option<String>,
+    /// The caret is inside a table.
+    pub table: bool,
+    /// Alignment of the table column at the caret.
+    pub column_align: Option<ColumnAlign>,
+}
+
+pub struct Snapshot {
+    pub doc: Document,
+    pub sel: Selection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKind {
+    None,
+    Typing,
+    Delete,
+    Other,
+}
+
+/// The editor state, independent of any UI framework.
+///
+/// The fields are public for the editor crates built on the core; use the
+/// methods from applications.
+pub struct EditorCore {
+    pub doc: Document,
+    pub sel: Selection,
+    pub layout: RefCell<Arc<Layout>>,
+    /// The document drawn into a display list (pages, text, decorations),
+    /// recorded on demand after each layout.
+    pub scene: RefCell<Option<Arc<Vec<Op>>>>,
+    pub viewport: Cell<Size>,
+    /// Counts layouts, so a UI can tell when to redraw cached content.
+    pub layout_generation: Cell<u64>,
+    pub style: EditorStyle,
+    pub paper: Paper,
+    pub zoom: f32,
+    pub zoom_settings: ZoomSettings,
+    pub tab_width: usize,
+    pub highlighter: Option<Arc<dyn CodeHighlighter>>,
+    pub highlight_cache: RefCell<HashMap<u64, Arc<Vec<Color>>>>,
+    pub features: Features,
+    /// Description of the placeholder of an image being saved.
+    pub pending_image_alt: String,
+    pub renderers: Vec<Arc<dyn BlockRenderer>>,
+    /// Language -> index in `renderers`.
+    pub renderer_languages: HashMap<String, usize>,
+    /// Measured sizes of rendered blocks.
+    pub render_cache: RefCell<HashMap<u64, Option<Size>>>,
+    pub image_settings: ImageSettings,
+    pub image_base: Option<PathBuf>,
+    pub image_loader: Option<ImageLoader>,
+    pub image_cache: RefCell<ImageCache>,
+    pub pending_images: HashMap<ImageId, Arc<[u8]>>,
+    pub next_image_id: u64,
+    /// Long `data:` URLs shortened in source mode.
+    pub embedded: source::Embedded,
+    pub mode: Mode,
+    pub focused: bool,
+    /// Whether the caret is in the visible phase of [`Input::Blink`].
+    pub caret_on: bool,
+    pub link_url: Option<String>,
+    pub link_range: Option<(Pos, Pos)>,
+    /// Open link dialog. The address is in `link_url`, the range in
+    /// `link_range`; without a dialog `link_url` shows the link bar.
+    pub link_dialog: Option<LinkDialog>,
+    /// Open context menu: its anchor in widget coordinates.
+    pub context_menu: Option<Point>,
+    /// The last pointer input was a touch: larger bar and menu targets.
+    pub touch: bool,
+    /// The input method's text being composed, inserted at the caret:
+    /// its start and end.
+    pub preedit: Option<(Pos, Pos)>,
+    pub fonts: Arc<Fonts>,
+    pub pending: Option<Style>,
+    pub goal_x: Option<f32>,
+    /// Word or block picked by a double or triple click. A drag that
+    /// follows extends by whole words or blocks and keeps it selected.
+    pub drag_unit: Option<(u8, Pos, Pos)>,
+    pub undo: Vec<Snapshot>,
+    pub redo: Vec<Snapshot>,
+    pub last_edit: EditKind,
+    pub modifiers: Modifiers,
+    pub last_activity: Instant,
+    pub scroll_x: f32,
+    pub scroll_y: f32,
+    pub revision: u64,
+    pub dirty: bool,
+    pub pending_events: Vec<Event>,
+}
+
+#[cfg(test)]
+impl EditorCore {
+    /// An empty document, measured with the fonts of the test suite.
+    pub(crate) fn new() -> Self {
+        Self::with_markdown("")
+    }
+
+    /// A document, measured with the fonts of the test suite.
+    pub(crate) fn with_markdown(markdown_text: &str) -> Self {
+        Self::with_fonts(markdown_text, crate::test_fonts())
+    }
+}
+
+impl EditorCore {
+    /// A document parsed from CommonMark (with the GFM extensions
+    /// strikethrough, task lists and tables; see [`Self::features`]),
+    /// measured with `fonts`.
+    pub fn with_fonts(markdown_text: &str, fonts: Arc<Fonts>) -> Self {
+        let state = Self {
+            doc: markdown::parse(markdown_text),
+            sel: Selection::caret(Pos::new(0, 0)),
+            layout: RefCell::new(Arc::new(Layout::default())),
+            scene: RefCell::new(None),
+            viewport: Cell::new(Size::new(1000.0, 700.0)),
+            layout_generation: Cell::new(0),
+            style: EditorStyle::default(),
+            paper: Paper::default(),
+            zoom: 1.0,
+            zoom_settings: ZoomSettings::default(),
+            tab_width: DEFAULT_TAB_WIDTH,
+            highlighter: None,
+            highlight_cache: RefCell::new(HashMap::new()),
+            features: Features::default(),
+            pending_image_alt: String::from("Saving image\u{2026}"),
+            renderers: Vec::new(),
+            renderer_languages: HashMap::new(),
+            render_cache: RefCell::new(HashMap::new()),
+            image_settings: ImageSettings::default(),
+            image_base: None,
+            image_loader: None,
+            image_cache: RefCell::new(ImageCache::default()),
+            pending_images: HashMap::new(),
+            next_image_id: 1,
+            embedded: source::Embedded::default(),
+            mode: Mode::Wysiwyg,
+            focused: false,
+            caret_on: true,
+            link_url: None,
+            link_range: None,
+            link_dialog: None,
+            context_menu: None,
+            touch: false,
+            preedit: None,
+            fonts,
+            pending: None,
+            goal_x: None,
+            drag_unit: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_edit: EditKind::None,
+            modifiers: Modifiers::empty(),
+            last_activity: Instant::now(),
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            revision: 0,
+            dirty: false,
+            pending_events: Vec::new(),
+        };
+        state.relayout();
+        state
+    }
+
+    /// Builder: sets the style.
+    pub fn style(mut self, style: EditorStyle) -> Self {
+        self.set_style(style);
+        self
+    }
+
+    /// Builder: sets the paper.
+    pub fn paper(mut self, paper: Paper) -> Self {
+        self.set_paper(paper);
+        self
+    }
+
+    /// Builder: sets the zoom settings.
+    pub fn zoom_settings(mut self, settings: ZoomSettings) -> Self {
+        self.set_zoom_settings(settings);
+        self
+    }
+
+    /// Builder: sets the initial zoom.
+    pub fn zoom(mut self, zoom: f32) -> Self {
+        self.set_zoom(zoom);
+        self
+    }
+
+    /// Builder: number of spaces the Tab key inserts (0 = Tab not handled).
+    pub fn tab_width(mut self, spaces: usize) -> Self {
+        self.set_tab_width(spaces);
+        self
+    }
+
+    /// Builder: installs a code highlighting plugin.
+    pub fn highlighter(mut self, highlighter: impl CodeHighlighter) -> Self {
+        self.set_highlighter(Some(Arc::new(highlighter)));
+        self
+    }
+
+    /// Builder: enables or disables optional Markdown features. The document
+    /// is read again with the new features.
+    pub fn features(mut self, features: Features) -> Self {
+        self.set_features(features);
+        self
+    }
+
+    /// Builder: adds a renderer for fenced code blocks of some languages.
+    /// Call it once per renderer; the first one listing a language wins.
+    pub fn block_renderer(mut self, renderer: impl BlockRenderer) -> Self {
+        let mut renderers = self.renderers.clone();
+        renderers.push(Arc::new(renderer));
+        self.set_block_renderers(renderers);
+        self
+    }
+
+    /// Builder: what happens with pasted, dropped and inserted images.
+    pub fn images(mut self, settings: ImageSettings) -> Self {
+        self.set_image_settings(settings);
+        self
+    }
+
+    /// Builder: folder for relative image URLs (desktop display).
+    pub fn image_base(mut self, folder: impl Into<PathBuf>) -> Self {
+        self.set_image_base(Some(folder.into()));
+        self
+    }
+
+    /// Builder: loads image bytes for display by URL.
+    pub fn image_loader(
+        mut self,
+        loader: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> Self {
+        self.set_image_loader(Some(Arc::new(loader)));
+        self
+    }
+
+    /// Builder: sets the mode.
+    pub fn mode(mut self, mode: Mode) -> Self {
+        self.set_mode(mode);
+        self
+    }
+
+    // ----------------------------------------------------------------
+    // Reading
+    // ----------------------------------------------------------------
+
+    /// The document as Markdown, without image placeholders and with full
+    /// `data:` URLs. Builds the whole text: call it on changes, not in `view`.
+    pub fn markdown(&self) -> String {
+        match self.mode {
+            Mode::Wysiwyg => markdown::serialize(&images::without_pending(&self.doc)),
+            Mode::Source => self
+                .embedded
+                .expand(&source::text(&images::without_pending(&self.doc))),
+        }
+    }
+
+    /// The document as plain text.
+    pub fn plain_text(&self) -> String {
+        self.doc.plain_text(self.doc.start(), self.doc.end())
+    }
+
+    /// The selected text, if any.
+    pub fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.sel.range();
+        (a != b).then(|| self.embedded.expand(&self.doc.plain_text(a, b)))
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.doc.word_count()
+    }
+
+    pub fn current_mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn current_style(&self) -> &EditorStyle {
+        &self.style
+    }
+
+    pub fn current_paper(&self) -> &Paper {
+        &self.paper
+    }
+
+    /// Current zoom factor (1.0 = 100 %).
+    pub fn current_zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    pub fn current_zoom_settings(&self) -> &ZoomSettings {
+        &self.zoom_settings
+    }
+
+    /// Spaces per Tab (0 = Tab not handled).
+    pub fn current_tab_width(&self) -> usize {
+        self.tab_width
+    }
+
+    pub fn current_image_settings(&self) -> &ImageSettings {
+        &self.image_settings
+    }
+
+    /// Images handed to the application and not answered yet.
+    pub fn pending_images(&self) -> usize {
+        self.pending_images.len()
+    }
+
+    pub fn has_highlighter(&self) -> bool {
+        self.highlighter.is_some()
+    }
+
+    pub fn current_features(&self) -> Features {
+        self.features
+    }
+
+    /// Languages drawn by block renderers.
+    pub fn rendered_languages(&self) -> Vec<String> {
+        self.renderers
+            .iter()
+            .flat_map(|renderer| renderer.languages())
+            .collect()
+    }
+
+    /// Languages offered for code blocks: from the highlighter (or a common
+    /// list) and the block renderers.
+    pub fn code_languages(&self) -> Vec<String> {
+        let languages = self
+            .highlighter
+            .as_ref()
+            .map(|highlighter| highlighter.languages())
+            .unwrap_or_default();
+        let mut languages: Vec<String> = if languages.is_empty() {
+            COMMON_LANGUAGES
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+        } else {
+            languages
+        };
+        for language in self.rendered_languages() {
+            if !languages.contains(&language) {
+                languages.push(language);
+            }
+        }
+        languages
+    }
+
+    /// `(checked, total)` task list items.
+    pub fn task_progress(&self) -> (usize, usize) {
+        let mut seen = Vec::new();
+        let mut checked = 0;
+        for block in &self.doc.blocks {
+            for container in &block.containers {
+                if let Container::Item {
+                    id,
+                    task: Some(done),
+                    ..
+                } = container
+                {
+                    if !seen.contains(id) {
+                        seen.push(*id);
+                        if *done {
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        (checked, seen.len())
+    }
+
+    /// Number of pages (1 in full-width mode).
+    pub fn page_count(&self) -> usize {
+        self.layout.borrow().pages.len().max(1)
+    }
+
+    /// Page (1-based) that contains the caret.
+    pub fn current_page(&self) -> usize {
+        self.layout.borrow().page_of(self.sel.head) + 1
+    }
+
+    pub fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    /// `true` when the content changed since the last load or save.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Formatting at the caret (or at the start of the selection).
+    pub fn formatting(&self) -> Formatting {
+        let (a, b) = self.sel.range();
+        let style = if a == b {
+            self.typing_style()
+        } else {
+            self.doc.blocks[a.block]
+                .styles
+                .get(a.offset)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let block = &self.doc.blocks[self.sel.head.block];
+        let leaf_kind = match block.leaf {
+            Leaf::Paragraph | Leaf::Line | Leaf::Cell(_) => BlockKind::Paragraph,
+            Leaf::Heading(level) => BlockKind::Heading(level),
+            Leaf::Code => BlockKind::Code,
+            Leaf::Html => BlockKind::Html,
+            Leaf::Rule => BlockKind::Rule,
+        };
+        let item = block
+            .containers
+            .iter()
+            .rev()
+            .find(|c| matches!(c, Container::Item { .. }));
+        Formatting {
+            bold: style.bold,
+            italic: style.italic,
+            strike: style.strike,
+            code: style.code,
+            link: style.link.map(|link| link.url.clone()),
+            block: leaf_kind,
+            list: item.and_then(Container::list).map(|list| list.ordered),
+            task: item.and_then(Container::task),
+            list_depth: block
+                .containers
+                .iter()
+                .filter(|c| c.list().is_some())
+                .count(),
+            quote: block.containers.iter().any(Container::is_quote),
+            code_language: if block.leaf == Leaf::Code {
+                block.language().map(str::to_string)
+            } else {
+                None
+            },
+            table: block.cell().is_some(),
+            column_align: block.cell().map(|cell| cell.align),
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Writing
+    // ----------------------------------------------------------------
+
+    /// Replaces the whole document. Clears history, pending images and the
+    /// dirty flag.
+    pub fn set_markdown(&mut self, markdown_text: &str) {
+        self.doc = match self.mode {
+            Mode::Wysiwyg => markdown::parse_with(markdown_text, self.features),
+            Mode::Source => source::document(&self.embedded.shorten(markdown_text)),
+        };
+        self.sel = Selection::caret(Pos::new(0, 0));
+        self.undo.clear();
+        self.redo.clear();
+        self.pending_images.clear();
+        self.reset_transient();
+        self.dirty = false;
+        self.revision += 1;
+        self.scroll_x = 0.0;
+        self.scroll_y = 0.0;
+        self.relayout();
+    }
+
+    /// Clears the dirty flag (call after saving).
+    pub fn mark_saved(&mut self) {
+        self.dirty = false;
+    }
+
+    pub fn set_style(&mut self, style: EditorStyle) {
+        self.style = style;
+        self.relayout();
+    }
+
+    pub fn set_paper(&mut self, paper: Paper) {
+        self.paper = paper;
+        self.relayout();
+        self.clamp_scroll();
+    }
+
+    pub fn set_zoom_settings(&mut self, settings: ZoomSettings) {
+        self.zoom_settings = settings;
+        self.zoom = self.zoom_settings.clamp(self.zoom);
+        self.relayout();
+        self.clamp_scroll();
+    }
+
+    /// Sets the zoom factor (1.0 = 100 %), also when zoom is disabled.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.zoom = self.zoom_settings.clamp(zoom);
+        self.relayout();
+        self.clamp_scroll();
+    }
+
+    /// Spaces per Tab; `0` leaves Tab to the application.
+    pub fn set_tab_width(&mut self, spaces: usize) {
+        self.tab_width = spaces.min(16);
+    }
+
+    pub fn set_highlighter(&mut self, highlighter: Option<Arc<dyn CodeHighlighter>>) {
+        self.highlighter = highlighter;
+        self.highlight_cache.borrow_mut().clear();
+        self.relayout();
+    }
+
+    /// Enables or disables optional Markdown features. In WYSIWYG mode the
+    /// document is read again, as if it had been loaded with the new
+    /// features; the undo history starts again.
+    pub fn set_features(&mut self, features: Features) {
+        if features == self.features {
+            return;
+        }
+        self.features = features;
+        if self.mode == Mode::Wysiwyg {
+            let text = markdown::serialize(&self.doc);
+            self.doc = markdown::parse_with(&text, features);
+            self.sel = Selection {
+                anchor: self.doc.clamp(self.sel.anchor),
+                head: self.doc.clamp(self.sel.head),
+            };
+            self.undo.clear();
+            self.redo.clear();
+            self.reset_transient();
+        }
+        self.relayout();
+    }
+
+    /// Replaces the block renderers. The first renderer listing a language
+    /// draws it.
+    pub fn set_block_renderers(&mut self, renderers: Vec<Arc<dyn BlockRenderer>>) {
+        let mut languages = HashMap::new();
+        for (index, renderer) in renderers.iter().enumerate() {
+            for language in renderer.languages() {
+                languages.entry(language).or_insert(index);
+            }
+        }
+        self.renderers = renderers;
+        self.renderer_languages = languages;
+        self.render_cache.borrow_mut().clear();
+        self.relayout();
+    }
+
+    pub fn set_image_settings(&mut self, settings: ImageSettings) {
+        self.image_settings = settings;
+    }
+
+    pub fn set_image_base(&mut self, folder: Option<PathBuf>) {
+        self.image_base = folder;
+        self.reload_images();
+    }
+
+    pub fn set_image_loader(&mut self, loader: Option<ImageLoader>) {
+        self.image_loader = loader;
+        self.reload_images();
+    }
+
+    /// Forgets loaded images and loads them again.
+    pub fn reload_images(&mut self) {
+        self.image_cache.borrow_mut().clear();
+        self.relayout();
+    }
+
+    /// Switches between WYSIWYG and source mode. The undo history starts
+    /// again after a switch.
+    pub fn set_mode(&mut self, mode: Mode) {
+        if mode == self.mode {
+            return;
+        }
+        self.doc = match mode {
+            Mode::Source => {
+                let text = markdown::serialize(&self.doc);
+                let text = self.embedded.shorten(&text);
+                source::document(&text)
+            }
+            Mode::Wysiwyg => {
+                let text = self.embedded.expand(&source::text(&self.doc));
+                markdown::parse_with(&text, self.features)
+            }
+        };
+        self.mode = mode;
+        self.sel = Selection::caret(Pos::new(0, 0));
+        self.undo.clear();
+        self.redo.clear();
+        self.reset_transient();
+        self.highlight_cache.borrow_mut().clear();
+        self.scroll_x = 0.0;
+        self.scroll_y = 0.0;
+        self.relayout();
+    }
+
+    /// Runs a command and reports what happened.
+    pub fn execute(&mut self, command: Command) -> Update {
+        self.update(Input::Command(command))
+    }
+
+    /// Handles an [`Input`] from the UI.
+    pub fn update(&mut self, input: Input) -> Update {
+        let revision = self.revision;
+        let sel = self.sel;
+        let mode = self.mode;
+        let focused = self.focused;
+        let zoom = self.zoom;
+
+        let effects = self.apply(input).0;
+
+        // A rendered block shows its code while the caret is in it.
+        if self.sel.head.block != sel.head.block
+            && (self.renderer_for(sel.head.block).is_some()
+                || self.renderer_for(self.sel.head.block).is_some())
+        {
+            self.relayout();
+        }
+
+        let mut events = std::mem::take(&mut self.pending_events);
+        if self.focused != focused {
+            events.push(if self.focused {
+                Event::Focused
+            } else {
+                Event::Blurred
+            });
+        }
+        if self.mode != mode {
+            events.push(Event::ModeChanged(self.mode));
+        }
+        if (self.zoom - zoom).abs() > f32::EPSILON {
+            events.push(Event::ZoomChanged(self.zoom));
+        }
+        if self.revision != revision {
+            events.push(Event::Changed);
+        }
+        if self.sel != sel {
+            events.push(Event::SelectionChanged);
+        }
+
+        Update { events, effects }
+    }
+
+    // ----------------------------------------------------------------
+    // Internal helpers
+    // ----------------------------------------------------------------
+
+    pub fn expand_width(&self) -> usize {
+        if self.tab_width == 0 {
+            DEFAULT_TAB_WIDTH
+        } else {
+            self.tab_width
+        }
+    }
+
+    pub fn new_image_id(&mut self) -> ImageId {
+        let id = ImageId(self.next_image_id);
+        self.next_image_id += 1;
+        id
+    }
+
+    /// Highlight colours for a code block, from the plugin (cached).
+    pub fn code_colors(&self, index: usize) -> Option<Arc<Vec<Color>>> {
+        let highlighter = self.highlighter.as_ref()?;
+        let block = self.doc.blocks.get(index)?;
+        if block.leaf != Leaf::Code || block.chars.is_empty() {
+            return None;
+        }
+        let language = block.language()?;
+        let palette = &self.style.palette;
+
+        let mut hasher = DefaultHasher::new();
+        language.hash(&mut hasher);
+        block.chars.hash(&mut hasher);
+        for channel in [palette.code_background, palette.code] {
+            channel.r.to_bits().hash(&mut hasher);
+            channel.g.to_bits().hash(&mut hasher);
+            channel.b.to_bits().hash(&mut hasher);
+        }
+        let key = hasher.finish();
+
+        if let Some(colors) = self.highlight_cache.borrow().get(&key) {
+            return Some(colors.clone());
+        }
+
+        let code: String = block.chars.iter().collect();
+        let spans = highlighter.highlight(&HighlightRequest {
+            language,
+            code: &code,
+            background: palette.code_background,
+            dark: highlight::is_dark(palette.code_background),
+        });
+
+        let len = block.chars.len();
+        let mut colors = vec![palette.code; len];
+        for span in spans {
+            let start = span.range.start.min(len);
+            let end = span.range.end.min(len);
+            for color in &mut colors[start..end.max(start)] {
+                *color = span.color;
+            }
+        }
+
+        let colors = Arc::new(colors);
+        let mut cache = self.highlight_cache.borrow_mut();
+        if cache.len() > 512 {
+            cache.clear();
+        }
+        cache.insert(key, colors.clone());
+        Some(colors)
+    }
+
+    /// The block renderer for block `index`, if it is a code block of one
+    /// of its languages (WYSIWYG mode only).
+    pub fn renderer_for(&self, index: usize) -> Option<&Arc<dyn BlockRenderer>> {
+        if self.mode != Mode::Wysiwyg || self.renderers.is_empty() {
+            return None;
+        }
+        let block = self.doc.blocks.get(index)?;
+        if block.leaf != Leaf::Code {
+            return None;
+        }
+        let renderer = *self.renderer_languages.get(block.language()?)?;
+        self.renderers.get(renderer)
+    }
+
+    /// Size of block `index` drawn by its renderer (cached); `None` while
+    /// the caret is in it or when the renderer declines.
+    fn measure_block(&self, index: usize, width: f32, max_height: f32) -> Option<Size> {
+        if index == self.sel.head.block {
+            return None;
+        }
+        let renderer = self.renderer_for(index)?;
+        let block = &self.doc.blocks[index];
+        let code: String = block.chars.iter().collect();
+
+        let mut hasher = DefaultHasher::new();
+        Arc::as_ptr(renderer).cast::<()>().hash(&mut hasher);
+        block.info.hash(&mut hasher);
+        code.hash(&mut hasher);
+        for value in [width, max_height, self.zoom] {
+            value.to_bits().hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        if let Some(size) = self.render_cache.borrow().get(&key) {
+            return *size;
+        }
+
+        let size = renderer.measure(&RenderRequest {
+            language: block.language().unwrap_or(""),
+            info: block.info.as_deref().unwrap_or(""),
+            code: &code,
+            width,
+            max_height,
+            zoom: self.zoom,
+            style: &self.style,
+        });
+        let mut cache = self.render_cache.borrow_mut();
+        if cache.len() > 512 {
+            cache.clear();
+        }
+        cache.insert(key, size);
+        size
+    }
+
+    /// Draws block `index` with its renderer; `available` is the room it
+    /// was measured for.
+    pub fn draw_block(&self, frame: &mut Frame, index: usize, bounds: Rectangle, available: Size) {
+        let Some(renderer) = self.renderer_for(index) else {
+            return;
+        };
+        let block = &self.doc.blocks[index];
+        let code: String = block.chars.iter().collect();
+        let request = RenderRequest {
+            language: block.language().unwrap_or(""),
+            info: block.info.as_deref().unwrap_or(""),
+            code: &code,
+            width: available.width,
+            max_height: available.height,
+            zoom: self.zoom,
+            style: &self.style,
+        };
+        renderer.draw(frame, bounds, &request);
+    }
+
+    pub fn relayout(&self) {
+        let cache = &self.image_cache;
+        let base = self.image_base.as_deref();
+        let loader = self.image_loader.as_ref();
+        let lookup = |url: &str| cache.borrow_mut().get(url, base, loader);
+        let custom = |index: usize, width: f32, max_height: f32| {
+            self.measure_block(index, width, max_height)
+        };
+        let layout = compute_layout(
+            &self.doc,
+            &self.fonts,
+            &self.style,
+            &self.paper,
+            self.viewport.get(),
+            self.zoom,
+            Lookups {
+                images: &lookup,
+                custom: &custom,
+            },
+        );
+        *self.layout.borrow_mut() = Arc::new(layout);
+        *self.scene.borrow_mut() = None;
+        self.layout_generation.set(self.layout_generation.get() + 1);
+    }
+
+    /// The document drawn into a display list, in document coordinates;
+    /// recorded once per layout.
+    pub fn content_scene(&self) -> Arc<Vec<Op>> {
+        if let Some(scene) = self.scene.borrow().as_ref() {
+            return scene.clone();
+        }
+        let layout = self.layout.borrow().clone();
+        let palette = self.style.palette;
+        let code_colors = |index: usize| self.code_colors(index);
+        let custom = |frame: &mut Frame, index: usize, bounds: Rectangle, available: Size| {
+            self.draw_block(frame, index, bounds, available)
+        };
+        let mut frame = Frame::new(Size::new(layout.width, layout.height), self.fonts.clone());
+        render::draw_pages(&mut frame, &layout, &palette);
+        render::draw_document(
+            &mut frame,
+            &self.doc,
+            &layout,
+            &palette,
+            &code_colors,
+            &custom,
+        );
+        let scene = Arc::new(frame.into_ops());
+        *self.scene.borrow_mut() = Some(scene.clone());
+        scene
+    }
+
+    /// Relayouts for a new widget size.
+    pub fn sync_viewport(&self, size: Size) {
+        let current = self.viewport.get();
+        if (current.width - size.width).abs() > 0.5 || (current.height - size.height).abs() > 0.5 {
+            self.viewport.set(size);
+            self.relayout();
+        }
+    }
+
+    /// Largest scroll offsets for the current layout and widget size.
+    pub fn max_scroll(&self) -> (f32, f32) {
+        let layout = self.layout.borrow();
+        let viewport = self.viewport.get();
+        (
+            (layout.width - viewport.width).max(0.0),
+            (layout.height - viewport.height).max(0.0),
+        )
+    }
+
+    /// Scroll offsets clamped to the content (used while drawing).
+    pub fn clamped_scroll(&self) -> (f32, f32) {
+        let (max_x, max_y) = self.max_scroll();
+        (
+            self.scroll_x.clamp(0.0, max_x),
+            self.scroll_y.clamp(0.0, max_y),
+        )
+    }
+
+    pub fn set_scroll(&mut self, x: f32, y: f32) {
+        let (max_x, max_y) = self.max_scroll();
+        let x = x.clamp(0.0, max_x);
+        let y = y.clamp(0.0, max_y);
+        if (x - self.scroll_x).abs() > 0.01 || (y - self.scroll_y).abs() > 0.01 {
+            self.scroll_x = x;
+            self.scroll_y = y;
+        }
+    }
+
+    pub fn clamp_scroll(&mut self) {
+        let (x, y) = (self.scroll_x, self.scroll_y);
+        self.set_scroll(x, y);
+    }
+
+    pub fn reset_transient(&mut self) {
+        self.pending = None;
+        self.goal_x = None;
+        self.last_edit = EditKind::None;
+        self.link_url = None;
+        self.link_range = None;
+        self.link_dialog = None;
+        self.context_menu = None;
+    }
+
+    /// Restarts the caret blinking (it is shown right after any activity).
+    pub fn touch(&mut self) {
+        self.last_activity = Instant::now();
+        self.caret_on = true;
+    }
+
+    pub fn typing_style(&self) -> Style {
+        match &self.pending {
+            Some(style) => style.clone(),
+            None => self.doc.typing_style(self.sel.range().0),
+        }
+    }
+
+    pub fn begin_edit(&mut self, kind: EditKind) {
+        let coalesce =
+            kind == self.last_edit && matches!(kind, EditKind::Typing | EditKind::Delete);
+        if !coalesce {
+            self.undo.push(Snapshot {
+                doc: self.doc.clone(),
+                sel: self.sel,
+            });
+            if self.undo.len() > 300 {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+        self.last_edit = kind;
+    }
+
+    pub(crate) fn after_edit(&mut self) -> Task {
+        self.dirty = true;
+        self.revision += 1;
+        self.goal_x = None;
+        self.relayout();
+        self.touch();
+        self.scroll_to_caret()
+    }
+
+    /// Scrolls so that the caret is visible.
+    pub(crate) fn scroll_to_caret(&mut self) -> Task {
+        let caret = self.layout.borrow().caret(self.sel.head);
+        let Some((x, y, height)) = caret else {
+            return Task::none();
+        };
+        let viewport = self.viewport.get();
+        let margin = 24.0;
+        let (mut sx, mut sy) = (self.scroll_x, self.scroll_y);
+
+        if y < sy + margin {
+            sy = y - 2.0 * margin;
+        } else if y + height > sy + viewport.height - margin {
+            sy = y + height - viewport.height + 2.0 * margin;
+        }
+        if !self.paper.is_fill() {
+            if x < sx + margin {
+                sx = x - 4.0 * margin;
+            } else if x > sx + viewport.width - margin {
+                sx = x - viewport.width + 4.0 * margin;
+            }
+        }
+        self.set_scroll(sx, sy);
+        Task::none()
+    }
+
+    /// Changes the zoom and keeps the visible area roughly in place.
+    pub(crate) fn zoom_to(&mut self, zoom: f32) -> Task {
+        let zoom = self.zoom_settings.clamp(zoom);
+        if (zoom - self.zoom).abs() < 1.0e-4 {
+            return Task::none();
+        }
+        let ratio = zoom / self.zoom;
+        let viewport = self.viewport.get();
+        let center_x = self.scroll_x + viewport.width / 2.0;
+        let center_y = self.scroll_y + viewport.height / 2.0;
+
+        self.zoom = zoom;
+        self.relayout();
+        self.set_scroll(
+            center_x * ratio - viewport.width / 2.0,
+            center_y * ratio - viewport.height / 2.0,
+        );
+        Task::none()
+    }
+
+    pub fn block_len(&self, index: usize) -> usize {
+        self.doc.blocks.get(index).map(Block::len).unwrap_or(0)
+    }
+}

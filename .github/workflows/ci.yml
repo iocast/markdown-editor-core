@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgtk-3-dev
+      - run: cargo clippy --all-targets --all-features
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgtk-3-dev
+      - run: cargo test --no-default-features
+      - run: cargo test --all-features
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target wasm32-unknown-unknown --all-features
+
+  # A breaking change shows up here, before it is released.
+  editors:
+    strategy:
+      fail-fast: false
+      matrix:
+        editor: [iced-markdown-editor, frust-markdown-editor]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: markdown-editor-core
+      - uses: actions/checkout@v4
+        with:
+          repository: iocast/${{ matrix.editor }}
+          path: ${{ matrix.editor }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.editor }}
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgtk-3-dev
+      - name: Test the editor against this commit
+        working-directory: ${{ matrix.editor }}
+        run: >
+          cargo test --all-features
+          --config 'patch.crates-io.markdown-editor-core.path="../markdown-editor-core"'

@@ -1,0 +1,45 @@
+[package]
+name = "markdown-editor-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+description = "UI-independent core of a Word-style WYSIWYG CommonMark editor"
+repository = "https://github.com/iocast/markdown-editor-core"
+homepage = "https://github.com/iocast/markdown-editor-core"
+documentation = "https://docs.rs/markdown-editor-core"
+readme = "README.md"
+keywords = ["markdown", "editor", "wysiwyg", "commonmark"]
+categories = ["text-editors"]
+# The fonts and the CommonMark suite are only used by the tests.
+exclude = [".github/", ".claude/", "tests/"]
+
+[features]
+default = []
+# Ready-made syntax highlighter for code blocks, based on syntect.
+syntect = ["dep:syntect"]
+# Decode images for display; paste images from the clipboard (desktop).
+images = ["dep:arboard", "dep:png", "dep:imagesize", "dep:image"]
+
+[dependencies]
+ab_glyph = "^0.2"
+pulldown-cmark = { version = "^0.13", default-features = false, features = ["html"] }
+# Instant / SystemTime that also work in the browser.
+web-time = "^1.1"
+# Pure-Rust regex engine: no Oniguruma C library needed.
+syntect = { version = "^5.3", default-features = false, features = ["default-fancy"], optional = true }
+imagesize = { version = "^0.15", optional = true }
+image = { version = "^0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"], optional = true }
+
+# Desktop only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arboard = { version = "^3.6", optional = true }
+png = { version = "^0.18", optional = true }
+
+[dev-dependencies]
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = "^1.0"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
