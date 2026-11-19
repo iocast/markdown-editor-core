@@ -5,6 +5,7 @@ use crate::features::Features;
 use crate::images::{ImageRejection, ImageSettings, PastedImage};
 use crate::layout::Decor;
 use crate::markdown::{parse, serialize};
+use crate::{Effect, Paper};
 
 fn round(doc: &Document) -> String {
     serialize(doc)
@@ -832,4 +833,146 @@ fn extending_by_a_long_block_does_not_jump_to_its_end() {
         editor.update(Input::Drag { x: 100.0, y });
     }
     assert!(editor.scroll_y > 0.0);
+}
+
+#[test]
+fn read_only_ignores_every_edit() {
+    let text = "# Title\n\n- [ ] task\n\nsome **bold** text\n";
+    let mut editor = EditorCore::with_markdown(text).read_only(true);
+    assert!(editor.is_read_only());
+    let before = editor.markdown();
+    let (x, y) = point_at(&editor, Pos::new(2, 2));
+    editor.update(Input::Press { x, y, clicks: 1 });
+    assert!(editor.is_focused(), "a click still places the caret");
+
+    let none = Modifiers::empty();
+    let command = Modifiers::COMMAND;
+    let inputs = [
+        Input::Key(Key::Character("x".into()), none, Some("x".into())),
+        Input::Key(Key::Named(Named::Backspace), none, None),
+        Input::Key(Key::Named(Named::Backspace), command, None),
+        Input::Key(Key::Named(Named::Delete), none, None),
+        Input::Key(Key::Named(Named::Enter), none, None),
+        Input::Key(Key::Named(Named::Enter), command, None),
+        Input::Key(Key::Named(Named::Tab), none, None),
+        Input::Key(Key::Character("b".into()), command, None),
+        Input::Key(Key::Character("x".into()), command, None),
+        Input::Key(Key::Character("v".into()), command, None),
+        Input::Compose("ab".into()),
+        Input::Commit("ab".into()),
+        Input::Paste(Some("pasted".into())),
+        Input::LinkDialog,
+        Input::LinkUrl("https://example.org".into()),
+        Input::LinkApply,
+        Input::Command(Command::InsertText("y".into())),
+        Input::Command(Command::SetBlock(BlockKind::Heading(2))),
+        Input::Command(Command::EditLink),
+        Input::Command(Command::InsertTable {
+            rows: 2,
+            columns: 2,
+        }),
+        Input::Command(Command::Undo),
+    ];
+    for input in inputs {
+        let update = editor.update(input.clone());
+        assert!(!update.events.contains(&Event::Changed), "{input:?}");
+        assert!(update.effects.is_empty(), "{input:?}");
+    }
+    assert_eq!(editor.markdown(), before);
+    assert!(editor.link_url.is_none());
+    assert!(!editor.is_dirty());
+
+    // A click on the task checkbox does not check it.
+    let (x, y) = {
+        let layout = editor.layout.borrow();
+        let task = &layout.tasks[0];
+        (task.x + task.size / 2.0, task.y + task.size / 2.0)
+    };
+    let update = editor.update(Input::Press { x, y, clicks: 1 });
+    assert!(!update.events.contains(&Event::Changed));
+    assert_eq!(editor.markdown(), before);
+}
+
+#[test]
+fn read_only_still_selects_copies_and_moves() {
+    let mut editor = EditorCore::with_markdown("hello world\n").read_only(true);
+    let (x, y) = point_at(&editor, Pos::new(0, 0));
+    editor.update(Input::Press { x, y, clicks: 1 });
+    editor.update(Input::Key(
+        Key::Named(Named::ArrowRight),
+        Modifiers::SHIFT,
+        None,
+    ));
+    assert_eq!(editor.selected_text().as_deref(), Some("h"));
+    let update = editor.execute(Command::SelectAll);
+    assert!(update.events.contains(&Event::SelectionChanged));
+    let update = editor.execute(Command::Copy);
+    assert_eq!(
+        update.effects,
+        vec![Effect::WriteClipboard("hello world".into())]
+    );
+    assert!(editor.allows(&Command::Copy));
+    assert!(!editor.allows(&Command::ToggleBold));
+    assert!(!editor.allows(&Command::Cut));
+}
+
+#[test]
+fn read_only_follows_links_with_a_plain_click() {
+    let text = "see [the site](https://example.org) here\n";
+    let click = |read_only: bool| {
+        let mut editor = EditorCore::with_markdown(text).read_only(read_only);
+        let (x, y) = point_at(&editor, Pos::new(0, 6));
+        editor.update(Input::Press { x, y, clicks: 1 }).events
+    };
+    assert!(click(true).contains(&Event::LinkClicked("https://example.org".into())));
+    assert!(
+        !click(false)
+            .iter()
+            .any(|event| matches!(event, Event::LinkClicked(_))),
+        "editing needs Ctrl/Cmd"
+    );
+}
+
+#[test]
+fn read_only_can_be_switched_off_again() {
+    let mut editor = EditorCore::with_markdown("a\n");
+    editor.execute(Command::Focus);
+    editor.execute(Command::EditLink);
+    editor.set_read_only(true);
+    assert!(editor.link_url.is_none(), "the link bar closes");
+    editor.execute(Command::InsertText("x".into()));
+    assert_eq!(editor.markdown(), "a\n");
+    editor.set_read_only(false);
+    editor.execute(Command::InsertText("x".into()));
+    assert_ne!(editor.markdown(), "a\n");
+}
+
+#[test]
+fn rendered_blocks_stay_rendered_when_read_only() {
+    let text = "intro\n\n```box\nx\n```\n";
+    let mut editor = EditorCore::with_markdown(text)
+        .block_renderer(Boxes)
+        .read_only(true);
+    let (x, y) = {
+        let layout = editor.layout.borrow();
+        let line = layout.lines.iter().find(|line| line.block == 1).unwrap();
+        (line.xs[0] + 10.0, line.y + 10.0)
+    };
+    editor.update(Input::Press { x, y, clicks: 1 });
+    assert_eq!(editor.sel.head.block, 1);
+    assert!(rendered(&editor, 1));
+}
+
+#[test]
+fn content_height_ignores_the_viewport_in_full_width_mode() {
+    let editor = EditorCore::with_markdown("one line\n").paper(Paper::fill());
+    editor.sync_viewport(Size::new(400.0, 2000.0));
+    let layout = editor.layout.borrow().clone();
+    assert_eq!(layout.height, 2000.0, "the page fills the viewport");
+    assert!(layout.content_height > 0.0 && layout.content_height < 100.0);
+
+    // Paper: the pages are the content.
+    let editor = EditorCore::with_markdown("one line\n");
+    let layout = editor.layout.borrow().clone();
+    assert_eq!(layout.content_height, layout.height);
 }

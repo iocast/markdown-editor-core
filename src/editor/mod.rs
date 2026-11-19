@@ -218,6 +218,31 @@ pub enum Command {
     FitPage,
 }
 
+impl Command {
+    /// Whether the command changes the document (or opens the link bar to
+    /// change it). These are ignored in a read-only editor; selecting,
+    /// copying, zoom, the mode, focus and answers to
+    /// [`Event::ImagePasted`] are not.
+    pub fn edits(&self) -> bool {
+        !matches!(
+            self,
+            Command::SelectAll
+                | Command::Copy
+                | Command::ResolveImage { .. }
+                | Command::CancelImage { .. }
+                | Command::SetMode(_)
+                | Command::Focus
+                | Command::Blur
+                | Command::ZoomIn
+                | Command::ZoomOut
+                | Command::ResetZoom
+                | Command::SetZoom(_)
+                | Command::FitWidth
+                | Command::FitPage
+        )
+    }
+}
+
 /// Something that happened inside the editor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -388,6 +413,9 @@ pub struct EditorCore {
     /// Long `data:` URLs shortened in source mode.
     pub embedded: source::Embedded,
     pub mode: Mode,
+    /// The user cannot change the document, only select, copy, scroll,
+    /// zoom and follow links ([`EditorCore::set_read_only`]).
+    pub read_only: bool,
     pub focused: bool,
     /// Whether the caret is in the visible phase of [`Input::Blink`].
     pub caret_on: bool,
@@ -466,6 +494,7 @@ impl EditorCore {
             next_image_id: 1,
             embedded: source::Embedded::default(),
             mode: Mode::Wysiwyg,
+            read_only: false,
             focused: false,
             caret_on: true,
             link_url: None,
@@ -569,6 +598,12 @@ impl EditorCore {
     /// Builder: sets the mode.
     pub fn mode(mut self, mode: Mode) -> Self {
         self.set_mode(mode);
+        self
+    }
+
+    /// Builder: makes the document read-only ([`Self::set_read_only`]).
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.set_read_only(read_only);
         self
     }
 
@@ -715,6 +750,18 @@ impl EditorCore {
         self.focused
     }
 
+    /// `true` when the user cannot change the document
+    /// ([`Self::set_read_only`]).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Whether `command` does anything with the current features and
+    /// read-only state, e.g. to disable buttons of a custom toolbar.
+    pub fn allows(&self, command: &Command) -> bool {
+        self.features.allows(command) && !(self.read_only && command.edits())
+    }
+
     /// `true` when the content changed since the last load or save.
     pub fn is_dirty(&self) -> bool {
         self.dirty
@@ -804,6 +851,26 @@ impl EditorCore {
     /// Clears the dirty flag (call after saving).
     pub fn mark_saved(&mut self) {
         self.dirty = false;
+    }
+
+    /// Makes the document read-only, e.g. to show Markdown rather than edit
+    /// it. The user can still select, copy, scroll, zoom and switch the
+    /// mode; a click on a link follows it without Ctrl/Cmd, and the task
+    /// checkboxes do not react. Commands that change the document
+    /// ([`Command::edits`]) are ignored; [`Self::set_markdown`] still
+    /// replaces it. Closes the link bar, link dialog and context menu.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        if read_only == self.read_only {
+            return;
+        }
+        self.read_only = read_only;
+        self.reset_transient();
+        self.preedit = None;
+        // Rendered blocks show their code while the caret is in them, but
+        // not in a read-only document.
+        if !self.renderers.is_empty() {
+            self.relayout();
+        }
     }
 
     pub fn set_style(&mut self, style: EditorStyle) {
@@ -943,7 +1010,8 @@ impl EditorCore {
         let effects = self.apply(input).0;
 
         // A rendered block shows its code while the caret is in it.
-        if self.sel.head.block != sel.head.block
+        if !self.read_only
+            && self.sel.head.block != sel.head.block
             && (self.renderer_for(sel.head.block).is_some()
                 || self.renderer_for(self.sel.head.block).is_some())
         {
@@ -1060,7 +1128,7 @@ impl EditorCore {
     /// Size of block `index` drawn by its renderer (cached); `None` while
     /// the caret is in it or when the renderer declines.
     fn measure_block(&self, index: usize, width: f32, max_height: f32) -> Option<Size> {
-        if index == self.sel.head.block {
+        if index == self.sel.head.block && !self.read_only {
             return None;
         }
         let renderer = self.renderer_for(index)?;

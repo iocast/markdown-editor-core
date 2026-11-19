@@ -245,6 +245,10 @@ pub struct Layout {
     /// Size of the whole document area (can exceed the viewport).
     pub width: f32,
     pub height: f32,
+    /// Height the content needs, without stretching to the viewport: in
+    /// full-width mode `height` is at least the viewport height, this is
+    /// not. Equal to `height` with paper.
+    pub content_height: f32,
     /// Full-width mode: no sheet, no page breaks.
     pub fill: bool,
 }
@@ -657,7 +661,8 @@ pub fn compute(
     } = pass;
 
     if fill {
-        let height = (flow.y + margin_bottom).max(viewport.height);
+        let content_height = flow.y + margin_bottom;
+        let height = content_height.max(viewport.height);
         layout.pages.push(PageRect {
             x: 0.0,
             y: 0.0,
@@ -666,6 +671,7 @@ pub fn compute(
         });
         layout.width = page_w;
         layout.height = height;
+        layout.content_height = content_height;
     } else {
         let count = flow.page + 1;
         for page in 0..count {
@@ -678,6 +684,7 @@ pub fn compute(
         }
         layout.width = width;
         layout.height = flow.page_top(count);
+        layout.content_height = layout.height;
     }
 
     layout

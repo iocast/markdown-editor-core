@@ -86,6 +86,9 @@ impl EditorCore {
         ) {
             self.preedit = None;
         }
+        if self.read_only && Self::edits(&inner) {
+            return Task::none();
+        }
         match inner {
             // Escape only closes the menu.
             Input::Key(Key::Named(Named::Escape), ..) if menu_open => {}
@@ -200,8 +203,26 @@ impl EditorCore {
         Task::none()
     }
 
+    /// Inputs that change the document and are ignored when read-only.
+    /// Keys and commands are checked where they are handled.
+    fn edits(input: &Input) -> bool {
+        matches!(
+            input,
+            Input::Compose(_)
+                | Input::Commit(_)
+                | Input::Paste(_)
+                | Input::FileDropped(_)
+                | Input::LinkUrl(_)
+                | Input::LinkDialog
+                | Input::LinkText(_)
+                | Input::LinkTab
+                | Input::LinkApply
+                | Input::LinkRemove
+        )
+    }
+
     fn command(&mut self, command: Command) -> Task {
-        if !self.features.allows(&command) {
+        if !self.allows(&command) {
             return Task::none();
         }
         let keeps_focus = !matches!(
@@ -371,7 +392,7 @@ impl EditorCore {
         self.focused = true;
 
         let task = self.layout.borrow().task_at(x, y);
-        if let Some(task) = task {
+        if let Some(task) = task.filter(|_| !self.read_only) {
             let current = self.doc.blocks[task.block].containers[task.depth].task();
             if let Some(checked) = current {
                 self.begin_edit(EditKind::Other);
@@ -384,7 +405,8 @@ impl EditorCore {
 
         let pos = self.layout.borrow().hit(x, y);
 
-        if clicks == 1 && self.modifiers.command() {
+        // Read-only documents follow links like a viewer: a plain click.
+        if clicks == 1 && (self.modifiers.command() || self.read_only) {
             self.open_link(pos);
         }
 
@@ -506,6 +528,12 @@ impl EditorCore {
             Key::Named(Named::End) => self.move_caret(Motion::End, shift, command),
             Key::Named(Named::PageUp) => self.move_caret(Motion::PageUp, shift, command),
             Key::Named(Named::PageDown) => self.move_caret(Motion::PageDown, shift, command),
+            // Also with Ctrl/Cmd: delete a word, check a task.
+            Key::Named(Named::Backspace | Named::Delete | Named::Enter | Named::Tab)
+                if self.read_only =>
+            {
+                return Task::none();
+            }
             Key::Named(Named::Backspace) => return self.backspace(command),
             Key::Named(Named::Delete) => return self.delete_forward(command),
             Key::Named(Named::Enter) if command => {
@@ -528,7 +556,7 @@ impl EditorCore {
                 };
             }
             _ => {
-                if let Some(text) = text {
+                if let Some(text) = text.filter(|_| !self.read_only) {
                     if !command && !text.is_empty() && text.chars().all(|c| !c.is_control()) {
                         return self.insert_text(&text, EditKind::Typing);
                     }
