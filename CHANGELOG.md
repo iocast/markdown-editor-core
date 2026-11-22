@@ -5,6 +5,8 @@ Format: Keep a Changelog (https://keepachangelog.com), versioning: Semantic Vers
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-22
+
 ### Added
 - Text input from mobile keyboards that sync whole values (Android, iOS): `EditorCore::ime_text` is the text they edit (the block with the caret, with the selection and the composed word), `Input::ImeSync` applies what they send back. Typing, Backspace (also at the start of a block, Word-style), autocorrect and word suggestions become ordinary edits
 
@@ -25,7 +27,8 @@ Format: Keep a Changelog (https://keepachangelog.com), versioning: Semantic Vers
 ### Added
 - The UI-independent core of `iced-markdown-editor` and `frust-markdown-editor`: document model, Markdown import and export, layout and pagination, editing, selection, undo, source mode, tables and a display list
 
-[unreleased]: https://github.com/iocast/markdown-editor-core/compare/v0.1.2...HEAD
+[unreleased]: https://github.com/iocast/markdown-editor-core/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/iocast/markdown-editor-core/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/iocast/markdown-editor-core/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/iocast/markdown-editor-core/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/iocast/markdown-editor-core/releases/tag/v0.1.0
