@@ -64,8 +64,8 @@ pub mod syntect;
 pub use doc::{BlockKind, ColumnAlign};
 pub use draw::{Frame, Image, Op, Path, PathSegment, PlacedGlyph, TextRun, Transform};
 pub use editor::{
-    Command, DEFAULT_TAB_WIDTH, EditorCore, Effect, Event, Formatting, Input, LinkDialog, Mode,
-    Update,
+    Command, DEFAULT_TAB_WIDTH, EditorCore, Effect, Event, Formatting, ImeText, Input, LinkDialog,
+    Mode, Update,
 };
 pub use extension::{BlockRenderer, RenderRequest};
 pub use features::Features;

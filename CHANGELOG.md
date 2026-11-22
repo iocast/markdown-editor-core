@@ -5,6 +5,9 @@ Format: Keep a Changelog (https://keepachangelog.com), versioning: Semantic Vers
 
 ## [Unreleased]
 
+### Added
+- Text input from mobile keyboards that sync whole values (Android, iOS): `EditorCore::ime_text` is the text they edit (the block with the caret, with the selection and the composed word), `Input::ImeSync` applies what they send back. Typing, Backspace (also at the start of a block, Word-style), autocorrect and word suggestions become ordinary edits
+
 ## [0.1.2] - 2026-11-19
 
 ### Added

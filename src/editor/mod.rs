@@ -12,9 +12,11 @@
 //! * `source`: Markdown source mode.
 
 mod edit;
+mod ime;
 pub mod source;
 
 pub use edit::builtin_command;
+pub use ime::ImeText;
 
 use crate::doc::{Block, BlockKind, ColumnAlign, Container, Document, Leaf, Pos, Selection, Style};
 use crate::draw::{Frame, Op};
@@ -123,6 +125,10 @@ pub enum Input {
     Commit(String),
     /// The input method session ended: the preedit stays as typed text.
     EndCompose,
+    /// The whole state of a mobile input method (Android, iOS), which
+    /// edits a copy of [`EditorCore::ime_text`]: what changed is typed or
+    /// deleted, then its selection and composed text are taken over.
+    ImeSync(ImeText),
     /// The last pointer input came from a touch screen (`true`) or a mouse:
     /// bars and menus get larger targets for fingers.
     Touch(bool),

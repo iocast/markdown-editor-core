@@ -83,6 +83,7 @@ impl EditorCore {
                 | Input::Touch(_)
                 | Input::Compose(_)
                 | Input::Commit(_)
+                | Input::ImeSync(_)
         ) {
             self.preedit = None;
         }
@@ -97,6 +98,7 @@ impl EditorCore {
             Input::Touch(touch) => self.touch = touch,
             Input::Compose(text) => return self.compose(&text),
             Input::Commit(text) => return self.commit(&text),
+            Input::ImeSync(state) => return self.ime_sync(state),
             // The preedit was forgotten above.
             Input::EndCompose => {}
             Input::Press { x, y, clicks } => return self.on_press(x, y, clicks),
@@ -210,6 +212,7 @@ impl EditorCore {
             input,
             Input::Compose(_)
                 | Input::Commit(_)
+                | Input::ImeSync(_)
                 | Input::Paste(_)
                 | Input::FileDropped(_)
                 | Input::LinkUrl(_)
@@ -728,7 +731,7 @@ impl EditorCore {
     }
 
     /// The input method's finished text: replaces the composed text.
-    fn commit(&mut self, text: &str) -> Task {
+    pub(crate) fn commit(&mut self, text: &str) -> Task {
         if self.link_url.is_some() || !self.focused {
             self.preedit = None;
             return Task::none();
@@ -957,7 +960,7 @@ impl EditorCore {
         self.after_edit()
     }
 
-    fn backspace(&mut self, by_word: bool) -> Task {
+    pub(crate) fn backspace(&mut self, by_word: bool) -> Task {
         let (a, b) = self.sel.range();
         if a != b {
             self.begin_edit(EditKind::Delete);
@@ -1030,7 +1033,7 @@ impl EditorCore {
         self.after_edit()
     }
 
-    fn delete_forward(&mut self, by_word: bool) -> Task {
+    pub(crate) fn delete_forward(&mut self, by_word: bool) -> Task {
         let (a, b) = self.sel.range();
         if a != b {
             self.begin_edit(EditKind::Delete);
